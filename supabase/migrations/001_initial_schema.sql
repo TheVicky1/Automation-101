@@ -1,6 +1,6 @@
 -- ============================================================================
 -- MIGRATION: 001_initial_schema.sql
--- DESCRIPTION: Production-hardened migration for Meta Ads WhatsApp Qualification System
+-- DESCRIPTION: Forward-only production migration for Meta Ads WhatsApp Lead Qualification System
 -- AUTHOR: Senior Database Architect
 -- DATE: 2026-09-15
 -- ============================================================================
@@ -8,7 +8,7 @@
 BEGIN;
 
 -- ----------------------------------------------------------------------------
--- 1. CREATE ENUM TYPES (FORWARD-ONLY DO BLOCKS)
+-- 1. CREATE ENUM TYPES (FORWARD-COMPATIBLE DO BLOCKS)
 -- ----------------------------------------------------------------------------
 DO $$
 BEGIN
@@ -47,26 +47,50 @@ CREATE OR REPLACE FUNCTION normalize_phone_e164(p_phone TEXT, p_default_cc TEXT 
 RETURNS TEXT AS $$
 DECLARE
   v_cleaned TEXT;
+  v_digits_only TEXT;
 BEGIN
   IF p_phone IS NULL OR TRIM(p_phone) = '' THEN
     RETURN NULL;
   END IF;
-  -- Remove non-digits except leading +
-  v_cleaned := regexp_replace(p_phone, '[^\d+]', '', 'g');
-  -- Handle double zeros prefix 00
+  
+  v_cleaned := TRIM(p_phone);
+  
+  -- Handle double zero prefix '00'
   IF v_cleaned LIKE '00%' THEN
     v_cleaned := '+' || substring(v_cleaned from 3);
   END IF;
-  -- Add + if missing
-  IF NOT v_cleaned LIKE '+%' THEN
-    -- If 10 digits, prefix default country code
-    IF length(v_cleaned) = 10 THEN
-      v_cleaned := '+' || p_default_cc || v_cleaned;
-    ELSE
-      v_cleaned := '+' || v_cleaned;
+  
+  -- Remove non-digits except leading +
+  v_cleaned := regexp_replace(v_cleaned, '[^\d+]', '', 'g');
+  
+  -- Explicit international E.164 string (+ prefix)
+  IF v_cleaned LIKE '+%' THEN
+    v_digits_only := substring(v_cleaned from 2);
+    IF length(v_digits_only) < 7 OR length(v_digits_only) > 15 THEN
+      RETURN NULL;
     END IF;
+    RETURN '+' || v_digits_only;
   END IF;
-  RETURN v_cleaned;
+  
+  -- Local digit string:
+  v_digits_only := v_cleaned;
+  
+  -- Handle leading 0 for 11-digit numbers (e.g. 09876543210 -> 9876543210)
+  IF v_digits_only LIKE '0%' AND length(v_digits_only) = 11 THEN
+    v_digits_only := substring(v_digits_only from 2);
+  END IF;
+  
+  -- If 10 digits (local Indian number), prepend default country code
+  IF length(v_digits_only) = 10 THEN
+    v_digits_only := p_default_cc || v_digits_only;
+  END IF;
+  
+  -- E.164 length check (7..15 digits)
+  IF length(v_digits_only) < 7 OR length(v_digits_only) > 15 THEN
+    RETURN NULL;
+  END IF;
+  
+  RETURN '+' || v_digits_only;
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
@@ -112,6 +136,13 @@ CREATE TABLE IF NOT EXISTS leads (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Forward-migration column additions for existing installations
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS first_meta_lead_id VARCHAR(255) NULL;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS latest_meta_lead_id VARCHAR(255) NULL;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS resubmission_count INT NOT NULL DEFAULT 0;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS last_inbound_at TIMESTAMPTZ NULL;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS last_outbound_at TIMESTAMPTZ NULL;
+
 -- ----------------------------------------------------------------------------
 -- 4. CREATE TABLE: lead_submissions (Historical Meta Submissions)
 -- ----------------------------------------------------------------------------
@@ -136,9 +167,18 @@ CREATE TABLE IF NOT EXISTS conversations (
   started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   last_activity_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  CONSTRAINT uq_conversations_id_lead UNIQUE (id, lead_id)
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Add composite unique constraint for existing installations
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'uq_conversations_id_lead'
+  ) THEN
+    ALTER TABLE conversations ADD CONSTRAINT uq_conversations_id_lead UNIQUE (id, lead_id);
+  END IF;
+END $$;
 
 -- ----------------------------------------------------------------------------
 -- 6. CREATE TABLE: messages (With Composite FK guaranteeing conversation lead alignment)
@@ -154,10 +194,18 @@ CREATE TABLE IF NOT EXISTS messages (
   message_body TEXT NULL,
   raw_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
   occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  CONSTRAINT fk_messages_conversation_lead FOREIGN KEY (conversation_id, lead_id) 
-    REFERENCES conversations(id, lead_id) ON DELETE RESTRICT
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'fk_messages_conversation_lead'
+  ) THEN
+    ALTER TABLE messages ADD CONSTRAINT fk_messages_conversation_lead 
+      FOREIGN KEY (conversation_id, lead_id) REFERENCES conversations(id, lead_id) ON DELETE RESTRICT;
+  END IF;
+END $$;
 
 -- ----------------------------------------------------------------------------
 -- 7. CREATE TABLE: followups
@@ -260,18 +308,25 @@ DECLARE
   v_existing_lead_by_meta UUID;
   v_resub_count INT := 0;
   v_is_resub BOOLEAN := FALSE;
+  v_clean_meta_id VARCHAR(255);
 BEGIN
   -- 1. Normalize Phone Numbers
   v_norm_phone := normalize_phone_e164(p_phone);
   v_norm_wa := normalize_phone_e164(p_whatsapp_number);
 
-  IF v_norm_phone IS NULL OR v_norm_phone = '' THEN
+  IF v_norm_phone IS NULL THEN
     RAISE EXCEPTION 'Invalid phone number provided for lead ingestion: %', p_phone;
   END IF;
 
+  v_clean_meta_id := NULLIF(TRIM(p_meta_lead_id), '');
+
   -- 2. Check if exact meta_lead_id already exists in submissions (Retry / Duplicate Webhook Guard)
-  IF p_meta_lead_id IS NOT NULL AND p_meta_lead_id <> '' THEN
-    SELECT lead_id INTO v_existing_lead_by_meta FROM lead_submissions WHERE meta_lead_id = p_meta_lead_id LIMIT 1;
+  IF v_clean_meta_id IS NOT NULL THEN
+    SELECT lead_id INTO v_existing_lead_by_meta 
+    FROM lead_submissions 
+    WHERE meta_lead_id = v_clean_meta_id 
+    LIMIT 1;
+
     IF v_existing_lead_by_meta IS NOT NULL THEN
       SELECT resubmission_count INTO v_resub_count FROM leads WHERE id = v_existing_lead_by_meta;
       RETURN QUERY SELECT v_existing_lead_by_meta, FALSE, COALESCE(v_resub_count, 0);
@@ -279,59 +334,53 @@ BEGIN
     END IF;
   END IF;
 
-  -- 3. Perform Lock & Lookup on Canonical Phone
-  SELECT id, resubmission_count INTO v_lead_id, v_resub_count
-  FROM leads WHERE phone = v_norm_phone FOR UPDATE;
+  -- 3. Atomic UPSERT on Canonical Phone
+  INSERT INTO leads (
+    phone, whatsapp_number, meta_lead_id, first_meta_lead_id, latest_meta_lead_id,
+    name, email, meta_created_at, meta_source, meta_form, meta_channel, meta_stage, meta_owner, meta_labels
+  )
+  VALUES (
+    v_norm_phone, v_norm_wa, v_clean_meta_id, v_clean_meta_id, v_clean_meta_id,
+    p_name, p_email, p_meta_created_at, p_meta_source, p_meta_form, p_meta_channel, p_meta_stage, p_meta_owner, COALESCE(p_meta_labels, '[]'::jsonb)
+  )
+  ON CONFLICT (phone) DO UPDATE SET
+    meta_lead_id = COALESCE(EXCLUDED.meta_lead_id, leads.meta_lead_id),
+    latest_meta_lead_id = COALESCE(EXCLUDED.latest_meta_lead_id, leads.latest_meta_lead_id),
+    whatsapp_number = COALESCE(EXCLUDED.whatsapp_number, leads.whatsapp_number),
+    name = COALESCE(EXCLUDED.name, leads.name),
+    email = COALESCE(EXCLUDED.email, leads.email),
+    meta_source = COALESCE(EXCLUDED.meta_source, leads.meta_source),
+    meta_form = COALESCE(EXCLUDED.meta_form, leads.meta_form),
+    resubmission_count = CASE 
+      WHEN EXCLUDED.meta_lead_id IS DISTINCT FROM leads.latest_meta_lead_id THEN leads.resubmission_count + 1
+      ELSE leads.resubmission_count
+    END,
+    updated_at = NOW()
+  RETURNING id, (resubmission_count > 0), resubmission_count 
+  INTO v_lead_id, v_is_resub, v_resub_count;
 
-  IF v_lead_id IS NOT NULL THEN
-    -- Resubmission path (Same phone, new meta_lead_id or no meta_lead_id)
-    v_is_resub := TRUE;
-    v_resub_count := v_resub_count + 1;
-
-    UPDATE leads SET
-      meta_lead_id = COALESCE(p_meta_lead_id, meta_lead_id),
-      latest_meta_lead_id = COALESCE(p_meta_lead_id, latest_meta_lead_id),
-      whatsapp_number = COALESCE(v_norm_wa, whatsapp_number),
-      name = COALESCE(p_name, name),
-      email = COALESCE(p_email, email),
-      meta_source = COALESCE(p_meta_source, meta_source),
-      meta_form = COALESCE(p_meta_form, meta_form),
-      resubmission_count = v_resub_count,
-      updated_at = NOW()
-    WHERE id = v_lead_id;
-
+  -- 4. Record Submission History (Ignore duplicate meta_lead_id if racing)
+  IF v_clean_meta_id IS NOT NULL THEN
+    INSERT INTO lead_submissions (lead_id, meta_lead_id, meta_form, meta_source, meta_created_at, raw_payload)
+    VALUES (v_lead_id, v_clean_meta_id, p_meta_form, p_meta_source, p_meta_created_at, COALESCE(p_raw_payload, '{}'::jsonb))
+    ON CONFLICT (meta_lead_id) WHERE meta_lead_id IS NOT NULL DO NOTHING;
   ELSE
-    -- Initial Submission path (New Phone)
-    v_is_resub := FALSE;
-    v_resub_count := 0;
-
-    INSERT INTO leads (
-      phone, whatsapp_number, meta_lead_id, first_meta_lead_id, latest_meta_lead_id,
-      name, email, meta_created_at, meta_source, meta_form, meta_channel, meta_stage, meta_owner, meta_labels
-    )
-    VALUES (
-      v_norm_phone, v_norm_wa, p_meta_lead_id, p_meta_lead_id, p_meta_lead_id,
-      p_name, p_email, p_meta_created_at, p_meta_source, p_meta_form, p_meta_channel, p_meta_stage, p_meta_owner, COALESCE(p_meta_labels, '[]'::jsonb)
-    )
-    RETURNING id INTO v_lead_id;
+    INSERT INTO lead_submissions (lead_id, meta_lead_id, meta_form, meta_source, meta_created_at, raw_payload)
+    VALUES (v_lead_id, NULL, p_meta_form, p_meta_source, p_meta_created_at, COALESCE(p_raw_payload, '{}'::jsonb));
   END IF;
-
-  -- 4. Record Submission History
-  INSERT INTO lead_submissions (lead_id, meta_lead_id, meta_form, meta_source, meta_created_at, raw_payload)
-  VALUES (v_lead_id, p_meta_lead_id, p_meta_form, p_meta_source, p_meta_created_at, COALESCE(p_raw_payload, '{}'::jsonb));
 
   -- 5. Audit Logging
   IF v_is_resub THEN
     INSERT INTO events (lead_id, event_type, payload)
     VALUES (v_lead_id, 'META_FORM_RESUBMITTED', jsonb_build_object(
-      'meta_lead_id', p_meta_lead_id,
+      'meta_lead_id', v_clean_meta_id,
       'form', p_meta_form,
       'resubmission_count', v_resub_count
     ));
   ELSE
     INSERT INTO events (lead_id, event_type, payload)
     VALUES (v_lead_id, 'LEAD_CREATED', jsonb_build_object(
-      'meta_lead_id', p_meta_lead_id,
+      'meta_lead_id', v_clean_meta_id,
       'form', p_meta_form,
       'source', p_meta_source
     ));
@@ -347,7 +396,8 @@ $$;
 CREATE OR REPLACE FUNCTION claim_scheduled_followups(
   p_worker_id VARCHAR(100),
   p_limit INT DEFAULT 10,
-  p_timeout_minutes INT DEFAULT 5
+  p_timeout_minutes INT DEFAULT 5,
+  p_max_attempts INT DEFAULT 5
 )
 RETURNS TABLE (
   out_followup_id UUID,
@@ -360,13 +410,34 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
-  -- 1. Reset stale processing tasks
+  -- 1. Invalidate tasks for leads that received inbound activity after task creation
+  UPDATE followups f
+  SET status = 'CANCELLED',
+      invalidated_reason = 'INBOUND_MESSAGE_RECEIVED',
+      updated_at = NOW()
+  FROM leads l
+  WHERE f.lead_id = l.id
+    AND f.status IN ('SCHEDULED', 'PROCESSING')
+    AND l.last_inbound_at IS NOT NULL
+    AND l.last_inbound_at > f.created_at;
+
+  -- 2. Mark failed tasks exceeding max attempts
+  UPDATE followups
+  SET status = 'FAILED',
+      error_log = 'Max execution attempts exceeded',
+      updated_at = NOW()
+  WHERE status = 'PROCESSING'
+    AND attempt_count >= p_max_attempts
+    AND claimed_at < NOW() - (p_timeout_minutes || ' minutes')::INTERVAL;
+
+  -- 3. Reset stale processing tasks below max attempts
   UPDATE followups
   SET status = 'SCHEDULED', claimed_at = NULL, claimed_by = NULL
   WHERE status = 'PROCESSING'
+    AND attempt_count < p_max_attempts
     AND claimed_at < NOW() - (p_timeout_minutes || ' minutes')::INTERVAL;
 
-  -- 2. Atomically Claim Ready Tasks
+  -- 4. Atomically Claim Ready Tasks
   RETURN QUERY
   WITH ready_tasks AS (
     SELECT f.id
@@ -378,6 +449,7 @@ BEGIN
       AND l.human_handoff = FALSE
       AND l.ai_active = TRUE
       AND l.status <> 'CLOSED'
+      AND (l.last_inbound_at IS NULL OR l.last_inbound_at < f.created_at)
     ORDER BY f.scheduled_for ASC
     FOR UPDATE OF f SKIP LOCKED
     LIMIT p_limit
@@ -409,15 +481,22 @@ AS $$
 DECLARE
   v_current_status message_status_enum;
 BEGIN
+  IF p_whatsapp_message_id IS NULL OR TRIM(p_whatsapp_message_id) = '' THEN
+    RETURN FALSE;
+  END IF;
+
   SELECT delivery_status INTO v_current_status
-  FROM messages WHERE whatsapp_message_id = p_whatsapp_message_id;
+  FROM messages WHERE whatsapp_message_id = p_whatsapp_message_id FOR UPDATE;
 
   IF v_current_status IS NULL THEN
     RETURN FALSE;
   END IF;
 
-  -- Enforce non-reversing transition rules (READ cannot go to SENT or DELIVERED)
-  IF v_current_status = 'READ' AND p_new_status IN ('SENT', 'DELIVERED', 'PENDING') THEN
+  -- State Machine Transition Guard: Block backward regressions
+  IF (v_current_status = 'READ' AND p_new_status IN ('PENDING', 'SENT', 'DELIVERED')) OR
+     (v_current_status = 'DELIVERED' AND p_new_status IN ('PENDING', 'SENT')) OR
+     (v_current_status = 'SENT' AND p_new_status = 'PENDING') OR
+     (v_current_status = 'FAILED' AND p_new_status IN ('PENDING', 'SENT', 'DELIVERED')) THEN
     RETURN FALSE;
   END IF;
 
@@ -433,15 +512,15 @@ $$;
 -- 14. SECURITY & EXPLICIT ROLE PRIVILEGES
 -- ----------------------------------------------------------------------------
 -- Lock down RPC functions from public execution
-REVOKE EXECUTE ON FUNCTION normalize_phone_e164 FROM PUBLIC, anon, authenticated;
-REVOKE EXECUTE ON FUNCTION ingest_meta_lead FROM PUBLIC, anon, authenticated;
-REVOKE EXECUTE ON FUNCTION claim_scheduled_followups FROM PUBLIC, anon, authenticated;
-REVOKE EXECUTE ON FUNCTION update_message_delivery_status FROM PUBLIC, anon, authenticated;
+REVOKE EXECUTE ON FUNCTION normalize_phone_e164(TEXT, TEXT) FROM PUBLIC, anon, authenticated;
+REVOKE EXECUTE ON FUNCTION ingest_meta_lead(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, TIMESTAMPTZ, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, JSONB, JSONB) FROM PUBLIC, anon, authenticated;
+REVOKE EXECUTE ON FUNCTION claim_scheduled_followups(VARCHAR, INT, INT, INT) FROM PUBLIC, anon, authenticated;
+REVOKE EXECUTE ON FUNCTION update_message_delivery_status(VARCHAR, message_status_enum) FROM PUBLIC, anon, authenticated;
 
-GRANT EXECUTE ON FUNCTION normalize_phone_e164 TO service_role;
-GRANT EXECUTE ON FUNCTION ingest_meta_lead TO service_role;
-GRANT EXECUTE ON FUNCTION claim_scheduled_followups TO service_role;
-GRANT EXECUTE ON FUNCTION update_message_delivery_status TO service_role;
+GRANT EXECUTE ON FUNCTION normalize_phone_e164(TEXT, TEXT) TO service_role;
+GRANT EXECUTE ON FUNCTION ingest_meta_lead(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, TIMESTAMPTZ, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, JSONB, JSONB) TO service_role;
+GRANT EXECUTE ON FUNCTION claim_scheduled_followups(VARCHAR, INT, INT, INT) TO service_role;
+GRANT EXECUTE ON FUNCTION update_message_delivery_status(VARCHAR, message_status_enum) TO service_role;
 
 -- Revoke direct table access from public/anon/authenticated
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC, anon, authenticated;
